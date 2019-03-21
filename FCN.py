@@ -5,8 +5,8 @@ import torchvision.transforms as tfs
 from PIL import Image
 import numpy as np
 import datetime
-import torch.functional as F
-
+import torch.nn.functional as F
+import torchvision
 
 
 
@@ -18,8 +18,10 @@ import torch.utils.model_zoo as model_zoo
 
 
 DATA = "./data"
-WIDTH = 300
-HEIGHT = 200
+WIDTH = 480
+HEIGHT = 320
+TRAIN_BATCH_SIZE = 16
+VALID_BATCH_SIZE = 32
 
 
 
@@ -73,16 +75,14 @@ class VOCSegDataSet(Dataset):
         return np.array(self.cm2lbl[idx], dtype='int64')  # 根据索引得到 label 矩阵
 
     # 选取固定区域
-    def rand_crop(self, data, label, height, width):
-        data = tfs.CenterCrop((height, width))(data)
-        data.show()
-        label = tfs.CenterCrop((height, width))(label)
-        label.show()
+    def rand_crop(self, data, label, crop_size):
+        data = tfs.CenterCrop((crop_size[0], crop_size[1]))(data)
+        label = tfs.CenterCrop((crop_size[0], crop_size[1]))(label)
         # label = tfs.FixedCrop(*rect)(label)
         return data, label
 
-    def img_transforms(self, im, label, height, width):
-        im, label = self.rand_crop(im, label, height, width)
+    def img_transforms(self, im, label, crop_size):
+        im, label = self.rand_crop(im, label, crop_size)
         im_tfs = tfs.Compose([
             tfs.ToTensor(),  # [0-255]--->[0-1]
             tfs.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])  # 均值方差。Normalize之后，神经网络在训练的过程中，梯度对每一张图片的作用都是平均的，也就是不存在比例不匹配的情况
@@ -109,7 +109,7 @@ class VOCSegDataSet(Dataset):
         label = self.label_list[idx]
         img = Image.open(img)
         label = Image.open(label).convert('RGB')
-        img, label = self.transforms(img, label, self.crop_size)
+        img, label = self.img_transforms(img, label, self.crop_size)
         return img, label
 
     def __len__(self):
@@ -119,7 +119,7 @@ class VOCSegDataSet(Dataset):
 
 
 class FCN(nn.Module):
-    def bilinear_kernel(in_channels, out_channels, kernel_size):
+    def bilinear_kernel(self,in_channels, out_channels, kernel_size):
         '''
         return a bilinear filter tensor
         '''
@@ -138,7 +138,8 @@ class FCN(nn.Module):
     def __init__(self,num_classes):
         super(FCN,self).__init__()
 
-        self.pretrained_net = model_zoo.resnet34(pretrained=True)
+        # self.pretrained_net = model_zoo.resnet34(pretrained=True)
+        self.pretrained_net = torchvision.models.resnet34(pretrained = True)
         self.stage1 = nn.Sequential(*list(self.pretrained_net.children())[:-4])  # 第一段
         self.stage2 = list(self.pretrained_net.children())[-4]  # 第二段
         self.stage3 = list(self.pretrained_net.children())[-3]  # 第三段
@@ -150,8 +151,8 @@ class FCN(nn.Module):
         self.upsample_8x = nn.ConvTranspose2d(num_classes, num_classes, 16, 8, 4, bias=False)
         self.upsample_8x.weight.data = self.bilinear_kernel(num_classes, num_classes, 16)  # 使用双线性 kernel
 
-        self.upsample_4x = nn.ConvTranspose2d(num_classes, num_classes, 4, 2, 1, bias=False)
-        self.upsample_4x.weight.data = self.bilinear_kernel(num_classes, num_classes, 4)  # 使用双线性 kernel
+        self.upsample_4x = nn.ConvTranspose2d(num_classes, num_classes, 8, 4, 2, bias=False)
+        self.upsample_4x.weight.data = self.bilinear_kernel(num_classes, num_classes, 8)  # 使用双线性 kernel
 
         self.upsample_2x = nn.ConvTranspose2d(num_classes, num_classes, 4, 2, 1, bias=False)
         self.upsample_2x.weight.data = self.bilinear_kernel(num_classes, num_classes, 4)  # 使用双线性 kernel
@@ -172,7 +173,7 @@ class FCN(nn.Module):
         s2 = s2 + s3
 
         s1 = self.scores3(s1)
-        s2 = self.upsample_4x(s2)
+        s2 = self.upsample_2x(s2)
         s = s1 + s2
 
         s = self.upsample_8x(s2)
@@ -264,7 +265,7 @@ class Main():
           - fwavacc
         """
         hist = np.zeros((n_class, n_class))
-        for lt, lp in zip(self.label_trues, label_preds):
+        for lt, lp in zip(label_trues, label_preds):
             hist += self._fast_hist(lt.flatten(), lp.flatten(), n_class)
         acc = np.diag(hist).sum() / hist.sum()
         acc_cls = np.diag(hist) / hist.sum(axis=1)
@@ -282,8 +283,8 @@ class Main():
         crop_size = [HEIGHT,WIDTH]
         voc_train = VOCSegDataSet(train = True,crop_size = crop_size)
         voc_test = VOCSegDataSet(train = False,crop_size = crop_size)
-        train_data = DataLoader(voc_train, 64, shuffle=True, num_workers=4)
-        valid_data = DataLoader(voc_test, 128, num_workers=4)
+        train_data = DataLoader(voc_train, TRAIN_BATCH_SIZE, shuffle=True, num_workers=4)
+        valid_data = DataLoader(voc_test, VALID_BATCH_SIZE, num_workers=4)
         self.net = FCN(len(self.classes))
         self.net.cuda()
         criterion = nn.NLLLoss2d()
@@ -297,7 +298,7 @@ class Main():
             train_mean_iu = 0
             train_fwavacc = 0
 
-            prev_time = datetime.now()
+            prev_time = datetime.datetime.now()
             net = self.net.train()
             for data in train_data:
                 im = data[0].cuda()
@@ -310,7 +311,7 @@ class Main():
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                train_loss += loss.data[0]
+                train_loss += loss.data.item()
 
                 label_pred = out.max(dim=1)[1].data.cpu().numpy()
                 label_true = label.data.cpu().numpy()
